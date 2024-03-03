@@ -1,19 +1,23 @@
-use std::{
-    collections::BTreeMap, error::Error, fs::File, io::Read, path::{Path, PathBuf}
-};
-
 use crate::{
-    Conflict, Define, Feature, IncludeEntry, Library, Recommendation, Require, SourceFile,
-    TemplateContribution, TemplateFile,
+    ConfigFile, Conflict, Define, Feature, IncludeEntry, Library, Recommendation, Require,
+    SourceFile, TemplateContribution, TemplateFile,
 };
 use serde::Deserialize;
+use std::{
+    error::Error,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComponentRaw {
     pub id: String,
     pub root_path: Option<String>,
+    pub component_root_path: Option<String>,
     pub source: Option<Vec<SourceFile>>,
     pub include: Option<Vec<IncludeEntry>>,
+    pub config_file: Option<Vec<ConfigFile>>,
     pub define: Option<Vec<Define>>,
     pub requires: Option<Vec<Require>>,
     pub provides: Option<Vec<Feature>>,
@@ -31,6 +35,7 @@ pub struct Component {
     pub sdk_root: PathBuf,
     pub source: Option<Vec<SourceFile>>,
     pub include: Option<Vec<IncludeEntry>>,
+    pub config_file: Option<Vec<ConfigFile>>,
     pub define: Option<Vec<Define>>,
     pub requires: Option<Vec<Require>>,
     pub provides: Option<Vec<Feature>>,
@@ -63,10 +68,11 @@ impl Component {
         let raw: ComponentRaw = serde_yaml::from_str(&data)?;
         let ret = Self {
             id: raw.id,
-            root_path: raw.root_path,
+            root_path: raw.component_root_path.or(raw.root_path),
             sdk_root: sdk_root.as_ref().to_path_buf(),
             source: raw.source,
             include: raw.include,
+            config_file: raw.config_file,
             define: raw.define,
             requires: raw.requires,
             provides: raw.provides,

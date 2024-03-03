@@ -1,26 +1,21 @@
+use crate::{
+    Component, ComponentId, ConfigFile, ConfigFileOverride, Define, Feature, IncludeEntry,
+    IntermediateTemplateContribution, Library, Parent, Require, ResolvedConfigFile, ResolvedDefine,
+    ResolvedIncludeEntry, ResolvedLibrary, ResolvedSourceFile, ResolvedTemplateFile,
+    ResolvedWithParent, SDKId, Satisfied, SourceFile, TemplateContribution, TemplateFile,
+    WithRootPath, SDK,
+};
 use core::panic;
+use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fs::{self, File},
-    io::{Read, Stdin, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     rc::Rc,
     vec,
-};
-
-use minijinja::{
-    value::{self, Kwargs, StructObject},
-    Environment,
-};
-use serde::{Deserialize, Serialize};
-
-use crate::{
-    Component, ComponentId, Define, Feature, IncludeEntry, IntermediateTemplateContribution,
-    Library, Parent, Require, ResolvedDefine, ResolvedIncludeEntry, ResolvedLibrary,
-    ResolvedSourceFile, ResolvedTemplateFile, ResolvedWithParent, SDKId, Satisfied, SourceFile,
-    TemplateContribution, TemplateFile, WithRootPath, SDK,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,6 +24,7 @@ pub struct ProjectRaw {
     pub sdk: SDKId,
     pub source: Option<Vec<SourceFile>>,
     pub include: Option<Vec<IncludeEntry>>,
+    pub config_file: Option<Vec<ConfigFile>>,
     pub component: Option<Vec<ComponentId>>,
     pub define: Option<Vec<Define>>,
     pub requires: Option<Vec<Require>>,
@@ -44,6 +40,7 @@ pub struct Project {
     pub root_path: PathBuf,
     pub source: Option<Vec<SourceFile>>,
     pub include: Option<Vec<IncludeEntry>>,
+    pub config_file: Option<Vec<ConfigFile>>,
     pub component: Option<Vec<ComponentId>>,
     pub define: Option<Vec<Define>>,
     pub requires: Option<Vec<Require>>,
@@ -68,6 +65,7 @@ impl Project {
             root_path,
             source: raw.source,
             include: raw.include,
+            config_file: raw.config_file,
             component: raw.component,
             define: raw.define,
             requires: raw.requires,
@@ -90,7 +88,7 @@ impl Project {
                     .components()
                     .iter()
                     .find(|c| c.id == id.id)
-                    .expect(format!("unknown component {}", id.id).as_str());
+                    .unwrap_or_else(|| panic!("unknown component {}", id.id));
 
                 components.push(c.clone());
             }
@@ -139,7 +137,7 @@ impl Project {
                 if additional_provides.is_empty() {
                     break;
                 }
-                provided_features.extend(additional_provides.into_iter());
+                provided_features.extend(additional_provides);
             }
 
             required_features.extend(
@@ -236,7 +234,7 @@ impl Project {
                             }
                         })
                         .collect();
-                    recommendation_ids.sort_by(|a, b| a.cmp(b));
+                    recommendation_ids.sort();
 
                     let recommended_components: Vec<_> = recommendation_ids
                         .into_iter()
@@ -244,7 +242,7 @@ impl Project {
                             sdk.components()
                                 .iter()
                                 .find(|c| c.id == id)
-                                .expect(format!("unknown component {}", id).as_str())
+                                .unwrap_or_else(|| panic!("unknown component {}", id))
                         })
                         // Filter only components that satisfy at least one requirement
                         .filter(|c| {
@@ -288,28 +286,12 @@ impl Project {
                         .collect::<Vec<_>>();
 
                     // We found at least one. Take the first and continue
-                    if non_conflicting_recommendations.len() >= 1 {
+                    if !non_conflicting_recommendations.is_empty() {
                         let c = **non_conflicting_recommendations.first().unwrap();
                         components.push(c.clone());
                         continue;
                     }
                 }
-                // eprintln!("provided:");
-                // for p in &provided_features {
-                //     eprintln!("  {}", p);
-                // }
-                // eprintln!("unsatisfied:");
-                // for u in &unsatisfied {
-                //     eprintln!("  {}", u);
-                // }
-                // eprintln!("recommendations:");
-                // for c in &components {
-                //     if let Some(ref recs) = c.recommends {
-                //         for r in recs {
-                //             eprintln!("  {}", r.id);
-                //         }
-                //     }
-                // }
 
                 panic!(
                     "Dependency resolution failed: no component found to satisfy open requirements"
@@ -332,6 +314,7 @@ pub struct ParsedProject {
     pub library: Vec<ResolvedLibrary>,
     pub template_file: Vec<ResolvedTemplateFile>,
     pub template_contribution: BTreeMap<String, Vec<minijinja::Value>>,
+    pub config_file: Vec<ResolvedConfigFile>,
     pub root_path: PathBuf,
     pub sdk_root_path: PathBuf,
     pub provided_features: BTreeSet<String>,
@@ -347,14 +330,17 @@ impl ParsedProject {
         let mut template_contribution: BTreeMap<String, Vec<IntermediateTemplateContribution>> =
             BTreeMap::new();
 
+        // Config files are collected in two steps: First the overrides, then the resulting files
+        let mut config_file_overrides: HashMap<ConfigFileOverride, ResolvedConfigFile> =
+            HashMap::new();
+        let mut config_file: Vec<ResolvedConfigFile> = Vec::new();
+
         let all_features = &resolved.provided_features;
 
         if let Some(s) = &project.source {
             source.extend(s.iter().filter_map(|e| {
                 if e.satisfied(all_features) {
                     Some(e.resolved(Parent::Project))
-                    // let relative = e.relative_to(&project.root_path);
-                    // Some((&relative).into())
                 } else {
                     None
                 }
@@ -385,6 +371,21 @@ impl ParsedProject {
                     None
                 }
             }));
+        }
+
+        if let Some(c) = &project.config_file {
+            let overrides: HashMap<ConfigFileOverride, ResolvedConfigFile> = c
+                .iter()
+                .filter_map(|e| {
+                    if !e.satisfied(all_features) {
+                        return None;
+                    }
+                    e.r#override
+                        .as_ref()
+                        .map(|o| (o.clone(), e.resolved(Parent::Project)))
+                })
+                .collect();
+            config_file_overrides.extend(overrides);
         }
 
         if let Some(d) = &project.define {
@@ -430,8 +431,6 @@ impl ParsedProject {
                 source.extend(s.iter().filter_map(|e: &SourceFile| {
                     if e.satisfied(all_features) {
                         Some(e.with_root_path(&comp.root_path).resolved(Parent::SDK))
-                    // let relative = e.relative_to(&comp.root_path);
-                    // Some((&relative).into())
                     } else {
                         None
                     }
@@ -463,6 +462,24 @@ impl ParsedProject {
                         None
                     }
                 }));
+            }
+
+            if let Some(c) = &comp.config_file {
+                let overrides: HashMap<ConfigFileOverride, ResolvedConfigFile> = c
+                    .iter()
+                    .filter_map(|e| {
+                        if !e.satisfied(all_features) {
+                            return None;
+                        }
+                        e.r#override.as_ref().map(|o| {
+                            (
+                                o.clone(),
+                                e.with_root_path(&comp.root_path).resolved(Parent::SDK),
+                            )
+                        })
+                    })
+                    .collect();
+                config_file_overrides.extend(overrides);
             }
 
             if let Some(d) = &comp.define {
@@ -514,6 +531,51 @@ impl ParsedProject {
             }
         }
 
+        if let Some(c) = &project.config_file {
+            // Only include non-override config files. Config files directly in the project cannot be overridden
+            config_file.extend(c.iter().filter_map(|e| {
+                if e.r#override.is_none() && e.satisfied(all_features) {
+                    Some(e.resolved(Parent::Project))
+                } else {
+                    None
+                }
+            }));
+        }
+
+        for comp in &resolved.components {
+            if let Some(c) = &comp.config_file {
+                // Only include non-override config files. For each, check if there exists an override we should use instead
+                for e in c
+                    .iter()
+                    .filter(|e| e.r#override.is_none() && e.satisfied(all_features))
+                {
+                    // Overriding a configuration file that doesn't have a file_id in the original component is not supported.
+                    if e.file_id.is_none() {
+                        config_file.push(e.with_root_path(&comp.root_path).resolved(Parent::SDK));
+                        continue;
+                    }
+
+                    // Try to find an override for this config
+                    let override_key = ConfigFileOverride {
+                        file_id: e.file_id.as_ref().unwrap().clone(),
+                        component: comp.id.clone(),
+                    };
+                    let overr = config_file_overrides.get(&override_key);
+
+                    if let Some(overr) = overr {
+                        // If there is an override, use it instead of the original, but preserve some of the fields
+                        config_file.push(ResolvedConfigFile {
+                            export: e.export,
+                            ..overr.clone()
+                        });
+                    } else {
+                        // If not, use the original
+                        config_file.push(e.with_root_path(&comp.root_path).resolved(Parent::SDK));
+                    }
+                }
+            }
+        }
+
         let template_contribution: BTreeMap<String, Vec<minijinja::Value>> = template_contribution
             .into_iter()
             .map(|(k, v)| {
@@ -527,6 +589,7 @@ impl ParsedProject {
             sdk_root_path: sdk.root_path.clone(),
             source,
             include,
+            config_file,
             define,
             library,
             template_file,
@@ -535,11 +598,17 @@ impl ParsedProject {
         }
     }
 
-    pub fn generate_templates(&self, out_dir: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
+    pub fn generate_templates(
+        &self,
+        out_dir: impl AsRef<Path>,
+    ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
         let vars = serde_yaml::to_string(&self.template_contribution)?;
         let script = include_str!("render_template.py");
 
-        let out_dir = out_dir.as_ref();
+        let out_dir = out_dir.as_ref().join("autogen");
+        fs::create_dir_all(&out_dir)?;
+
+        let mut ret = Vec::new();
 
         for template in &self.template_file {
             let root_path = match template.parent {
@@ -554,6 +623,7 @@ impl ParsedProject {
             } else {
                 panic!("template file must have .jinja or .jinja2 extension")
             };
+            let out_filename = Path::new(out_filename).file_name().unwrap();
             let out_path = out_dir.join(out_filename);
 
             // read the file at template_path into a string
@@ -588,10 +658,89 @@ impl ParsedProject {
             }
             let output = output.stdout;
 
-            fs::create_dir_all(out_path.parent().unwrap())?;
-            fs::write(out_path, output)?;
+            fs::write(&out_path, output)?;
+            ret.push(out_path);
         }
 
-        Ok(())
+        Ok(ret)
+    }
+
+    pub fn generate_config_files(
+        &self,
+        out_dir: impl AsRef<Path>,
+    ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+        if self.config_file.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let out_dir = out_dir.as_ref().join("config");
+        fs::create_dir_all(&out_dir)?;
+
+        let mut ret = Vec::new();
+
+        for config_file in &self.config_file {
+            let root_path = match config_file.parent {
+                Parent::Project => &self.root_path,
+                Parent::SDK => &self.sdk_root_path,
+            };
+            let config_path = root_path.join(&config_file.path);
+            let config_filename = config_path.file_name().unwrap();
+
+            let out_path_suffix = match (&config_file.directory, &config_file.export) {
+                (None, Some(true)) => Some("export".to_string()),
+                (Some(_), Some(true)) => {
+                    panic!("config file cannot have both directory and export")
+                }
+                (Some(ref d), _) => Some(d.clone()),
+                (None, _) => None,
+            };
+
+            let out_path = if let Some(suffix) = out_path_suffix {
+                out_dir.join(suffix).join(config_filename)
+            } else {
+                out_dir.join(config_filename)
+            };
+
+            fs::copy(&config_path, &out_path)?;
+
+            ret.push(out_path);
+        }
+
+        Ok(ret)
+    }
+
+    pub fn get_included_headers(&self) -> Vec<PathBuf> {
+        let mut ret = Vec::new();
+
+        for source in &self.source {
+            let root_path = match source.parent {
+                Parent::Project => &self.root_path,
+                Parent::SDK => &self.sdk_root_path,
+            };
+
+            let source_path = root_path.join(&source.path);
+            if source_path.extension().map_or(false, |e| e == "h") {
+                ret.push(source_path);
+            }
+        }
+
+        for include in &self.include {
+            if let Some(file_list) = &include.file_list {
+                let root_path = match include.parent {
+                    Parent::Project => &self.root_path,
+                    Parent::SDK => &self.sdk_root_path,
+                };
+                let include_path = root_path.join(&include.path);
+
+                for file in file_list {
+                    let header_path = include_path.join(&file.path);
+                    if header_path.extension().map_or(false, |e| e == "h") {
+                        ret.push(header_path);
+                    }
+                }
+            }
+        }
+
+        ret
     }
 }

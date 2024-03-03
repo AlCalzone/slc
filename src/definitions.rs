@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use serde::Deserialize;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Parent {
@@ -58,6 +58,62 @@ impl ResolvedWithParent for SourceFile {
             directory: self.directory.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigFile {
+    pub path: String,
+    pub file_id: Option<String>,
+    pub directory: Option<String>,
+    pub export: Option<bool>,
+    pub r#override: Option<ConfigFileOverride>,
+    pub condition: Option<Vec<String>>,
+    pub unless: Option<Vec<String>>,
+}
+
+impl WithRootPath for ConfigFile {
+    fn with_root_path(&self, root_path: &Option<String>) -> Self {
+        if let Some(root) = root_path {
+            Self {
+                path: Path::new(root)
+                    .join(&self.path)
+                    .to_string_lossy()
+                    .to_string(),
+                ..self.clone()
+            }
+        } else {
+            self.clone()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedConfigFile {
+    pub path: String,
+    pub parent: Parent,
+    pub file_id: Option<String>,
+    pub directory: Option<String>,
+    pub export: Option<bool>,
+}
+
+impl ResolvedWithParent for ConfigFile {
+    type T = ResolvedConfigFile;
+
+    fn resolved(&self, parent: Parent) -> Self::T {
+        Self::T {
+            path: self.path.clone(),
+            parent,
+            file_id: self.file_id.clone(),
+            directory: self.directory.clone(),
+            export: self.export,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
+pub struct ConfigFileOverride {
+    pub file_id: String,
+    pub component: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,11 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
-    fs::File,
-    io::Read,
-    path::{self, Path},
-    rc::Rc,
-};
+use std::collections::BTreeSet;
 
 mod sdk;
 pub use sdk::*;
@@ -15,7 +8,6 @@ mod component;
 pub use component::*;
 mod definitions;
 pub use definitions::*;
-
 
 trait Satisfied {
     fn satisfied(&self, features: &BTreeSet<String>) -> bool;
@@ -45,6 +37,7 @@ macro_rules! impl_satisfied_for {
 
 impl_satisfied_for!(SourceFile);
 impl_satisfied_for!(IncludeEntry);
+impl_satisfied_for!(ConfigFile);
 impl_satisfied_for!(HeaderFile);
 impl_satisfied_for!(Define);
 impl_satisfied_for!(TemplateFile);
@@ -96,36 +89,3 @@ impl Satisfied for Recommendation {
         true
     }
 }
-
-// fn relative_to(path: &String, root_path: &Option<String>) -> String {
-//     if let Some(root) = root_path {
-//         path::PathBuf::from(root)
-//             .join(path)
-//             .to_string_lossy()
-//             .to_string()
-//     } else {
-//         path.clone()
-//     }
-// }
-
-// trait RelativeTo {
-//     fn relative_to(&self, root_path: &Option<String>) -> Self;
-// }
-
-// macro_rules! impl_relative_to_for {
-//     ($t:ty) => {
-//         impl RelativeTo for $t {
-//             fn relative_to(&self, root_path: &Option<String>) -> Self {
-//                 Self {
-//                     path: relative_to(&self.path, &root_path),
-//                     ..self.clone()
-//                 }
-//             }
-//         }
-//     };
-// }
-
-// impl_relative_to_for!(SourceFile);
-// impl_relative_to_for!(IncludeEntry);
-// impl_relative_to_for!(HeaderFile);
-// impl_relative_to_for!(TemplateFile);

@@ -1,3 +1,5 @@
+use crate::{Component, ComponentPath};
+use serde::Deserialize;
 use std::{
     error::Error,
     fs::File,
@@ -5,9 +7,6 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
-
-use crate::{Component, ComponentPath};
-use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SDKRaw {
@@ -64,7 +63,7 @@ pub fn load_components(
         .iter()
         .flat_map(|comp_dir| {
             let comp_dir = sdk_root.join(&comp_dir.path);
-            let Ok(read_dir) = std::fs::read_dir(&comp_dir) else {
+            let Ok(read_dir) = std::fs::read_dir(comp_dir) else {
                 return vec![];
             };
 
