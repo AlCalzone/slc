@@ -11,14 +11,20 @@ use std::{
 #[derive(Debug, Clone, Deserialize)]
 pub struct SDKRaw {
     pub id: String,
+    pub label: Option<String>,
+    pub description: Option<String>,
     pub sdk_version: String,
+    pub specification_version: Option<u32>,
+    pub supplier: Option<String>,
     pub component_path: Vec<ComponentPath>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SDK {
     pub id: String,
+    pub label: Option<String>,
     pub sdk_version: String,
+    pub specification_version: Option<u32>,
     pub root_path: PathBuf,
     components: Vec<Rc<Component>>,
 }
@@ -36,7 +42,9 @@ impl SDK {
 
         let ret = Self {
             id: raw.id,
+            label: raw.label,
             sdk_version: raw.sdk_version,
+            specification_version: raw.specification_version,
             root_path,
             components,
         };
@@ -46,6 +54,23 @@ impl SDK {
 
     pub fn components(&self) -> &[Rc<Component>] {
         &self.components
+    }
+
+    /// Build an SDK directly from already-parsed components, bypassing disk
+    /// discovery. Intended for tests.
+    pub fn from_components(
+        id: impl Into<String>,
+        root_path: PathBuf,
+        components: Vec<Rc<Component>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: None,
+            sdk_version: String::new(),
+            specification_version: None,
+            root_path,
+            components,
+        }
     }
 }
 
@@ -70,14 +95,19 @@ pub fn load_components(
             let files = read_dir
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|f| f.file_type().unwrap().is_file())
+                .filter(|f| f.file_type().map(|t| t.is_file()).unwrap_or(false))
                 .filter(|f| matches!(f.path().extension(), Some(ext) if ext == "slcc"));
 
+            // A single unparseable component is skipped with a warning rather
+            // than aborting the whole SDK load.
             let components: Vec<_> = files
                 .into_iter()
-                .map(move |f| {
-                    let comp = Component::parse(f.path(), sdk_root).unwrap();
-                    Rc::new(comp)
+                .filter_map(move |f| match Component::parse(f.path(), sdk_root) {
+                    Ok(comp) => Some(Rc::new(comp)),
+                    Err(e) => {
+                        eprintln!("slc: warning: skipping {}: {e}", f.path().display());
+                        None
+                    }
                 })
                 .collect();
             components

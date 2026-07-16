@@ -44,6 +44,9 @@ impl_satisfied_for!(TemplateFile);
 impl_satisfied_for!(TemplateContribution);
 impl_satisfied_for!(SystemLibrary);
 impl_satisfied_for!(SDKLibrary);
+impl_satisfied_for!(Configuration);
+impl_satisfied_for!(ToolchainSetting);
+impl_satisfied_for!(OtherFile);
 
 impl Satisfied for Library {
     fn satisfied(&self, features: &BTreeSet<String>) -> bool {
