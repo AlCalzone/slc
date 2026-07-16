@@ -33,8 +33,10 @@ directory.
   (`{{instance}}` path substitution plus the `INSTANCE`/`{{instance}}` content
   transforms).
 
-Template rendering shells out to `python3` + `jinja2` (+ `pyyaml`), so those must
-be installed to render `template_file` templates.
+Template rendering is pure Rust ([minijinja](https://docs.rs/minijinja)); there
+is no external runtime dependency. A small shim backs the jinja2 `list.append()`
+mutation idiom that core SDK templates (e.g. `sl_event_handler.c`) use for
+deduplication.
 
 ## Tests
 

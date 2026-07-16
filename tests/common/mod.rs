@@ -107,14 +107,3 @@ pub fn write_file(path: &Path, contents: &str) {
     }
     fs::write(path, contents).unwrap();
 }
-
-/// Template rendering shells out to python3 + jinja2 + pyyaml. Tests that
-/// exercise it skip cleanly where those are unavailable.
-pub fn python_available() -> bool {
-    std::process::Command::new("python3")
-        .arg("-c")
-        .arg("import jinja2, yaml")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
