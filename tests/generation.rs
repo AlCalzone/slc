@@ -209,3 +209,30 @@ fn mutable_list_append_dedup_idiom_renders() {
     fx.generate(&format!("{BASE_PROJECT}component:\n- {{id: c}}\n"));
     assert_eq!(fx.read_out("autogen/dedup.txt"), "abc");
 }
+
+#[test]
+fn sdk_library_path_gets_component_root_path_prefix() {
+    // Like sources and config files, an SDK `library:` path is relative to the
+    // component's root_path (e.g. librail's archives live under rail_library/)
+    let fx = Fixture::new();
+    fx.component(
+        "libcomp",
+        "id: libcomp\nroot_path: vendor/lib\nlibrary:\n- {path: autogen/libfoo.a}\n- {system: m}\n",
+    );
+    let parsed =
+        fx.build("project_name: p\nsdk: {id: test_sdk, version: 1}\ncomponent:\n- {id: libcomp}\n");
+    let sdk_paths: Vec<&str> = parsed
+        .library
+        .iter()
+        .filter_map(|l| match l {
+            slc::ResolvedLibrary::SDK(s) => Some(s.path.as_str()),
+            slc::ResolvedLibrary::System(_) => None,
+        })
+        .collect();
+    assert_eq!(sdk_paths, ["vendor/lib/autogen/libfoo.a"]);
+    // System libraries have no path and must pass through untouched.
+    assert!(parsed
+        .library
+        .iter()
+        .any(|l| matches!(l, slc::ResolvedLibrary::System(s) if s.system == "m")));
+}

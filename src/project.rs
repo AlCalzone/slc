@@ -654,7 +654,7 @@ impl ParsedProject {
             if let Some(l) = &comp.library {
                 library.extend(l.iter().filter_map(|e: &Library| {
                     if e.satisfied(all_features) {
-                        Some(e.into())
+                        Some((&e.with_root_path(&comp.root_path)).into())
                     } else {
                         None
                     }
