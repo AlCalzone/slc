@@ -12,6 +12,17 @@ fn parse_component(yaml: &str) -> Component {
 }
 
 #[test]
+fn project_parses_from_string_without_touching_disk() {
+    // `from_str` accepts the `.slcp` body in memory, so callers need not write
+    // a temporary file just to parse a project.
+    let root = PathBuf::from("/nonexistent/project/dir");
+    let p = Project::from_str("project_name: p\nsdk: {id: s, version: 1}\n", root.clone())
+        .expect("project parses from a string");
+    assert_eq!(p.project_name, "p");
+    assert_eq!(p.root_path, root);
+}
+
+#[test]
 fn project_name_accepts_name_alias() {
     // Spec: `name` is a backwards-compatible alias for `project_name`.
     let p = parse_project("name: blink\nsdk: {id: s, version: 1}\n");
