@@ -187,9 +187,7 @@ pub struct Define {
     pub unless: Option<Vec<String>>,
 }
 
-/// Deserialize a `#define` value written as any YAML scalar into its string
-/// form. Real SDK components write integer values unquoted (`value: 4`), which
-/// a plain `Option<String>` rejects, failing the whole component's parse.
+/// Deserialize a `#define` value written as any YAML scalar into its string form
 fn deserialize_scalar_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
