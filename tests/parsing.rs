@@ -159,3 +159,16 @@ fn substitute_instance_replaces_placeholder() {
     // No placeholder: unchanged.
     assert_eq!(substitute_instance("plain.h", "z"), "plain.h");
 }
+
+#[test]
+fn configuration_accepts_any_scalar_value() {
+    // Real .slcp files write configuration values unquoted (numbers,
+    // booleans); every scalar deserializes into its string form.
+    let p = parse_project(
+        "project_name: p\nsdk: {id: s, version: 1}\nconfiguration:\n- {name: A, value: 9}\n- {name: B, value: true}\n- {name: C, value: SL_FOO}\n",
+    );
+    let cfg = p.configuration.unwrap();
+    assert_eq!(cfg[0].value, "9");
+    assert_eq!(cfg[1].value, "true");
+    assert_eq!(cfg[2].value, "SL_FOO");
+}
