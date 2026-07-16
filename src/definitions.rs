@@ -181,9 +181,26 @@ impl From<&HeaderFile> for ResolvedHeaderFile {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Define {
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_scalar_string")]
     pub value: Option<String>,
     pub condition: Option<Vec<String>>,
     pub unless: Option<Vec<String>>,
+}
+
+/// Deserialize a `#define` value written as any YAML scalar into its string form
+fn deserialize_scalar_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match serde_yaml::Value::deserialize(deserializer)? {
+        serde_yaml::Value::Null => Ok(None),
+        serde_yaml::Value::Bool(b) => Ok(Some(b.to_string())),
+        serde_yaml::Value::Number(n) => Ok(Some(n.to_string())),
+        serde_yaml::Value::String(s) => Ok(Some(s)),
+        other => Err(serde::de::Error::custom(format!(
+            "define value must be a scalar, got {other:?}"
+        ))),
+    }
 }
 
 #[derive(Debug)]

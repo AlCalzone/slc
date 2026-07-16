@@ -99,6 +99,30 @@ fn unmodeled_keys_do_not_break_parsing() {
 }
 
 #[test]
+fn define_value_accepts_any_yaml_scalar() {
+    // Real SDK components write integer/bool `#define` values unquoted. Each
+    // must parse to its string form rather than failing the whole component.
+    let c = parse_component(
+        "id: c\ndefine:\n- {name: A_INT, value: 4}\n- {name: A_FLOAT, value: 1.5}\n- {name: A_BOOL, value: true}\n- {name: A_STR, value: '7'}\n- {name: A_NONE}\n",
+    );
+    let defines = c.define.unwrap();
+    assert_eq!(defines[0].value.as_deref(), Some("4"));
+    assert_eq!(defines[1].value.as_deref(), Some("1.5"));
+    assert_eq!(defines[2].value.as_deref(), Some("true"));
+    assert_eq!(defines[3].value.as_deref(), Some("7"));
+    assert_eq!(defines[4].value, None);
+}
+
+#[test]
+fn define_with_integer_value_does_not_skip_component() {
+    // The bug: an unquoted integer failed `Option<String>` serde, aborting the
+    // component parse so it was dropped with a warning. It must parse instead.
+    let c = parse_component("id: with_int\ndefine:\n- name: SL_COUNT\n  value: 12\n");
+    assert_eq!(c.id, "with_int");
+    assert_eq!(c.define.unwrap()[0].value.as_deref(), Some("12"));
+}
+
+#[test]
 fn library_system_and_path_variants_parse() {
     let c = parse_component(
         "id: c\nlibrary:\n- system: gcc\n  unless: [device_host]\n- path: lib/libfoo.a\n",
