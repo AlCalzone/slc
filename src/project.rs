@@ -117,8 +117,7 @@ impl Project {
                         .or_default()
                         .extend(list.iter().cloned());
                 }
-                // A component may be listed more than once (e.g. two instance
-                // entries); add it to C only once.
+                // Deduplicate: a component may appear in multiple instance entries
                 if components.iter().any(|c| c.id == id.id) {
                     continue;
                 }
@@ -213,7 +212,7 @@ impl Project {
                 .cloned()
                 .collect();
             if unsatisfied.is_empty() {
-                // Success criterion: K disjoint from P.
+                // Success criterion: K disjoint from P
                 let clashing: Vec<String> = conflicts
                     .intersection(&provided_features)
                     .cloned()
@@ -458,8 +457,7 @@ impl std::error::Error for ResolveError {}
 pub struct ResolveResult {
     pub components: Vec<Rc<Component>>,
     pub provided_features: BTreeSet<String>,
-    /// Instance names per component id, for instantiable components included
-    /// with an explicit `instance` list in the project.
+    // Per-component instance names for instantiable components
     pub instances: BTreeMap<String, Vec<String>>,
 }
 
@@ -472,8 +470,7 @@ pub struct ParsedProject {
     pub template_file: Vec<ResolvedTemplateFile>,
     pub template_contribution: BTreeMap<String, Vec<minijinja::Value>>,
     pub config_file: Vec<ResolvedConfigFile>,
-    /// Project-level configuration overrides, already filtered by
-    /// condition/unless and kept in declaration order (last match wins).
+    // Project-level configuration overrides, already filtered by condition/unless
     pub configuration: Vec<Configuration>,
     pub root_path: PathBuf,
     pub sdk_root_path: PathBuf,
@@ -721,8 +718,7 @@ impl ParsedProject {
                     };
 
                     for inst in expand {
-                        // SDK stage: source path uses the prefix; output name
-                        // uses the instance name.
+                        // Source path uses the prefix; output name uses the instance name
                         let (src_path, output_name) = match (inst, prefix) {
                             (Some(instance), Some(pfx)) => {
                                 let src = substitute_instance(&e.path, pfx);
@@ -734,8 +730,7 @@ impl ParsedProject {
                             _ => (e.path.clone(), None),
                         };
 
-                        // Locate an override (preferring an instance-specific
-                        // one) when the entry declares a file_id.
+                        // Prefer an instance-specific override over a generic one
                         let overr = e.file_id.as_ref().and_then(|fid| {
                             let by_instance = inst.and_then(|instance| {
                                 config_file_overrides.get(&ConfigFileOverride {
@@ -777,9 +772,7 @@ impl ParsedProject {
             }
         }
 
-        // A contribution list is ordered by priority (lowest/most-negative
-        // first), with the contributing component id as a deterministic
-        // tiebreak. The stable sort preserves declaration order within a tie.
+        // Stable sort preserves declaration order within a (priority, component_id) tie
         let template_contribution: BTreeMap<String, Vec<minijinja::Value>> = template_contribution
             .into_iter()
             .map(|(k, mut v)| {
@@ -822,9 +815,7 @@ impl ParsedProject {
         }
     }
 
-    /// Generate the full project output tree under `out_dir`: the standard
-    /// `autogen/` and `config/` directories (with their `export/` subdirs) are
-    /// always created, then config files and templates are emitted.
+    /// Generate the full project output tree under `out_dir`, including `autogen/` and `config/` directories
     pub fn generate(&self, out_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Box<dyn Error>> {
         let out_dir = out_dir.as_ref();
         for sub in ["autogen/export", "config/export"] {
@@ -844,19 +835,15 @@ impl ParsedProject {
         fs::create_dir_all(&export)?;
 
         let mut env = Environment::new();
-        // Preserve the template's trailing newline; autoescape only markup
-        // outputs (C/header/text templates must be emitted verbatim).
+        // Preserve trailing newlines (off by default in minijinja)
         env.set_keep_trailing_newline(true);
         env.set_auto_escape_callback(|name| match name.rsplit('.').next() {
             Some("html" | "htm" | "xml" | "xhtml") => AutoEscape::Html,
             _ => AutoEscape::None,
         });
-        // SLC `format` adds a prefix/suffix to each line (overrides the
-        // printf-style builtin).
+        // Overrides minijinja's printf-style `format` with the SLC line-prefix variant
         env.add_filter("format", format_filter);
-        // Backs the `{% set x = [] %}` + `x.append(...)` dedup idiom that
-        // jinja2 supports via list mutation but minijinja's immutable values do
-        // not. `new_list()` yields a mutable list; see rewrite_empty_list_sets.
+        // Backs the jinja2 `list.append()` idiom that minijinja can't do natively
         env.add_function("new_list", || Value::from_object(MutableList::default()));
 
         // Contribution variables are available to every template by name.
@@ -870,16 +857,13 @@ impl ParsedProject {
         for template in &self.template_file {
             let template_path = self.root_for(template.parent).join(&template.path);
 
-            // The source file name (with its .jinja suffix) names the template
-            // in the generated banner.
+            // The source file name (with its .jinja suffix) names the template in the generated banner.
             let source_name = Path::new(&template.path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or("template path has no file name")?
                 .to_string();
 
-            // Strip a trailing .jinja/.jinja2 for the output name; otherwise
-            // keep the file name unchanged.
             let stripped = template
                 .path
                 .strip_suffix(".jinja")
@@ -934,8 +918,7 @@ impl ParsedProject {
 
         for config_file in &self.config_file {
             let src = self.root_for(config_file.parent).join(&config_file.path);
-            // An instantiable config file emits under its instance-substituted
-            // name; otherwise it keeps the source file name.
+            // Prefer the given name of an instantiable config file, fall back to the source file name.
             let config_filename: String = match &config_file.output_name {
                 Some(n) => n.clone(),
                 None => src
@@ -945,8 +928,7 @@ impl ParsedProject {
                     .into_owned(),
             };
 
-            // export takes precedence; directory places the file in a config/
-            // subdirectory; otherwise the file lands directly in config/.
+            // Determine the output path based on export, directory, and output_name properties
             let out_path = if config_file.export == Some(true) {
                 config_root.join("export").join(&config_filename)
             } else if let Some(dir) = &config_file.directory {
@@ -978,8 +960,7 @@ impl ParsedProject {
     }
 
     /// Rewrite `#define NAME value` lines in a freshly-copied config header
-    /// with the project's configuration overrides. Applied only on first copy;
-    /// the last matching rule for a given name wins.
+    /// with the project's configuration overrides
     fn apply_configuration(&self, contents: &str) -> String {
         if self.configuration.is_empty() {
             return contents.to_string();
@@ -1030,8 +1011,7 @@ fn is_header(path: &Path) -> bool {
     )
 }
 
-/// Join a component-relative path onto its optional root_path, mirroring
-/// [`WithRootPath`] for a bare string path.
+/// Join a component-relative path onto its optional root_path
 fn join_root(root: &Option<String>, path: &str) -> String {
     match root {
         Some(r) => Path::new(r).join(path).to_string_lossy().into_owned(),
@@ -1044,9 +1024,7 @@ fn has_instance_ph(s: &str) -> bool {
     substitute_instance(s, "\u{1}") != s
 }
 
-/// If `line` is an object-like `#define NAME ...` whose NAME has an override,
-/// return the line with the value replaced (indentation and trailing newline
-/// preserved). Otherwise return the line unchanged.
+/// Replace `#define NAME ...` in `line` with the given overrides, if any
 fn rewrite_define_line(line: &str, values: &HashMap<&str, &str>) -> String {
     let (content, nl) = match line.strip_suffix('\n') {
         Some(c) => (c, "\n"),
@@ -1080,8 +1058,7 @@ fn rewrite_define_line(line: &str, values: &HashMap<&str, &str>) -> String {
     }
 }
 
-/// The banner the built-in `autogenerated_file` global expands to, naming the
-/// source template.
+/// The banner the built-in `autogenerated_file` global expands to
 fn autogenerated_banner(template_name: &str) -> String {
     format!(
         "This file is autogenerated by Silicon Labs SLC.\n\
@@ -1107,9 +1084,7 @@ fn format_filter(value: String, kwargs: Kwargs) -> Result<String, minijinja::Err
     Ok(prefix_each_line(&value, &prefix, &suffix))
 }
 
-/// A mutable list backing the jinja2 `list.append()` idiom. minijinja values
-/// are immutable, so templates that dedup via `{% set x = [] %}` followed by
-/// `x.append(...)` need a shared-mutable object instead.
+// Backs the jinja2 `list.append()` idiom that minijinja can't do natively
 #[derive(Debug, Default)]
 struct MutableList(Mutex<Vec<Value>>);
 
@@ -1151,8 +1126,7 @@ impl Object for MutableList {
 }
 
 /// Rewrite `{% set <ident> = [] %}` to `{% set <ident> = new_list() %}` so the
-/// list can later be mutated via `.append(...)`. Whitespace-control dashes are
-/// preserved. Only an exact empty-list literal is touched.
+/// list can later be mutated via `.append(...)`
 fn rewrite_empty_list_sets(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;

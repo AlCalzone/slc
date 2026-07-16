@@ -52,8 +52,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // The only supported subcommand is `generate`; accept it explicitly or
-    // treat a lone project path as an implicit generate.
     let mut project_path: Option<String> = None;
     for p in positionals {
         if p == "generate" {

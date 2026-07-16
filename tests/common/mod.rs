@@ -92,7 +92,7 @@ impl Fixture {
     }
 
     /// Write the SDK `.slcs` and the project `.slcp` to disk and return their
-    /// paths, without running the pipeline (for driving the CLI binary).
+    /// paths, without running the pipeline.
     pub fn prepare(&self, project_yaml: &str) -> (PathBuf, PathBuf) {
         self.write_slcs();
         let slcp = self.project_dir.join("project.slcp");

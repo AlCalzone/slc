@@ -58,6 +58,7 @@ impl SDK {
 
     /// Build an SDK directly from already-parsed components, bypassing disk
     /// discovery. Intended for tests.
+    #[doc(hidden)]
     pub fn from_components(
         id: impl Into<String>,
         root_path: PathBuf,
@@ -98,8 +99,7 @@ pub fn load_components(
                 .filter(|f| f.file_type().map(|t| t.is_file()).unwrap_or(false))
                 .filter(|f| matches!(f.path().extension(), Some(ext) if ext == "slcc"));
 
-            // A single unparseable component is skipped with a warning rather
-            // than aborting the whole SDK load.
+            // Skip unparseable components rather than aborting the SDK load
             let components: Vec<_> = files
                 .into_iter()
                 .filter_map(move |f| match Component::parse(f.path(), sdk_root) {

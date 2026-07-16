@@ -144,8 +144,6 @@ fn template_contributions_order_by_priority_then_component_id() {
     assert_eq!(order, ["3", "2", "1"]);
 }
 
-// ----- template rendering (native minijinja) -----
-
 #[test]
 fn templates_route_to_autogen_and_export_with_banner() {
     let fx = Fixture::new();

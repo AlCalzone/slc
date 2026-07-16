@@ -1,6 +1,4 @@
-//! Instantiable-component conformance: per-instance config file expansion,
-//! the {{instance}} path substitution stages, the INSTANCE content transform,
-//! per-instance defines, and instance-targeted config overrides.
+//! Instantiable-component conformance.
 
 mod common;
 use common::Fixture;

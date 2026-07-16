@@ -68,11 +68,7 @@ impl Component {
     }
 
     pub fn from_str(data: &str, sdk_root: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
-        // Strip a leading `!!omap` YAML tag. serde_yaml cannot deserialize a
-        // struct from a tagged ordered-map, so drop the tag line and remove the
-        // 2-char list prefix (`- ` or two-space continuation) from each body
-        // line, leaving a plain mapping. Char-safe so blank/short/multibyte
-        // lines don't panic.
+        // Strip `!!omap` because serde_yaml can't deserialize a tagged ordered-map
         let cleaned;
         let data = if data.starts_with("!!omap") {
             cleaned = data
@@ -115,12 +111,13 @@ impl Component {
     }
 }
 
-/// A `component:` entry in a `.slcp`. `instance` names apply to instantiable
-/// components; `from` selects a component supplied by a named SDK extension.
+/// A `component:` entry in a `.slcp`
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComponentId {
     pub id: String,
+    // Instance names for instantiable components
     pub instance: Option<Vec<String>>,
+    // SDK extension that supplies this component
     pub from: Option<String>,
     pub condition: Option<Vec<String>>,
 }

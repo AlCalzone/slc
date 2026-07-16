@@ -89,16 +89,15 @@ impl WithRootPath for ConfigFile {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedConfigFile {
-    // Source path to read from disk (already instance-prefix-substituted).
+    // Source path on disk, already instance-prefix-substituted
     pub path: String,
     pub parent: Parent,
     pub file_id: Option<String>,
     pub directory: Option<String>,
     pub export: Option<bool>,
-    // Output file name override (instance-substituted), when the source path
-    // differs from the emitted name for an instantiable component.
+    // Output file name override for instantiable components
     pub output_name: Option<String>,
-    // Instance this file was expanded for, driving the content transform.
+    // Instance this file was expanded for
     pub instance: Option<String>,
 }
 
@@ -122,7 +121,7 @@ impl ResolvedWithParent for ConfigFile {
 pub struct ConfigFileOverride {
     pub file_id: String,
     pub component: String,
-    // Targets a single instance of an instantiable component's config file
+    // Targets a single instance of an instantiable component
     pub instance: Option<String>,
 }
 
@@ -241,8 +240,7 @@ pub struct IntermediateTemplateContribution {
     pub name: String,
     pub value: minijinja::Value,
     pub priority: Option<i16>,
-    // Contributing component id (empty for project-level contributions); used
-    // as the tiebreak when two contributions share a priority.
+    // Contributing component id, used as tiebreak when priorities match
     pub component_id: String,
 }
 
@@ -362,9 +360,7 @@ impl From<&SDKLibrary> for ResolvedSDKLibrary {
     }
 }
 
-/// Component/project quality level. Legacy values are remapped on read per the
-/// SLC 1.2 spec: `test` -> `experimental`, and any unrecognized value ->
-/// `evaluation` (`production`/`internal` map to themselves).
+/// Component/project quality level
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
     Production,
@@ -399,15 +395,13 @@ impl<'de> Deserialize<'de> for Quality {
     }
 }
 
-/// A component that can be included multiple times under distinct instance
-/// names. `prefix` is the default instance name used by GUIs.
+/// A component that can be included multiple times under distinct instance names
 #[derive(Debug, Clone, Deserialize)]
 pub struct Instantiable {
     pub prefix: String,
 }
 
-/// A project-level override of a component configuration option. Applied once,
-/// when the config header is first copied into the generated `config/` tree.
+/// A project-level override of a component configuration option
 #[derive(Debug, Clone, Deserialize)]
 pub struct Configuration {
     pub name: String,
@@ -457,8 +451,7 @@ impl PostBuild {
     }
 }
 
-/// Replace `{{instance}}` (whitespace-insensitive inside the braces) with the
-/// given value. Used for both stages of instantiable path expansion.
+/// Replace `{{instance}}` with the given value
 pub fn substitute_instance(input: &str, value: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -480,10 +473,7 @@ pub fn substitute_instance(input: &str, value: &str) -> String {
     out
 }
 
-/// Transform config-file content for an instance. In C/C++ headers the literal
-/// token `INSTANCE` becomes the uppercased instance name; in `.xml` files
-/// `{{instance}}` is replaced with the instance name verbatim. Other file types
-/// are copied unchanged.
+/// Transform config-file content for an instance, matching the conventions of the target filenames
 pub fn transform_instance_content(path: &Path, instance: &str, content: &str) -> String {
     match path.extension().and_then(|e| e.to_str()) {
         Some("h" | "hh" | "hpp" | "hxx") => content.replace("INSTANCE", &instance.to_uppercase()),
