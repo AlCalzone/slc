@@ -187,7 +187,7 @@ pub struct Define {
     pub unless: Option<Vec<String>>,
 }
 
-/// Deserialize a `#define` value written as any YAML scalar into its string form
+/// Deserialize a value written as any YAML scalar into its string form
 fn deserialize_scalar_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -198,9 +198,18 @@ where
         serde_yaml::Value::Number(n) => Ok(Some(n.to_string())),
         serde_yaml::Value::String(s) => Ok(Some(s)),
         other => Err(serde::de::Error::custom(format!(
-            "define value must be a scalar, got {other:?}"
+            "value must be a scalar, got {other:?}"
         ))),
     }
+}
+
+/// Like [`deserialize_scalar_string`], for values that must be present
+fn deserialize_required_scalar_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_scalar_string(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("value must be a scalar, got null"))
 }
 
 #[derive(Debug)]
@@ -448,6 +457,7 @@ pub struct Instantiable {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Configuration {
     pub name: String,
+    #[serde(deserialize_with = "deserialize_required_scalar_string")]
     pub value: String,
     pub condition: Option<Vec<String>>,
     pub unless: Option<Vec<String>>,
