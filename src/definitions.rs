@@ -337,6 +337,16 @@ impl From<&Library> for ResolvedLibrary {
     }
 }
 
+impl WithRootPath for Library {
+    fn with_root_path(&self, root_path: &Option<String>) -> Self {
+        match self {
+            // System libraries are toolchain-level (-lm etc.), no path to prefix
+            Library::System(_) => self.clone(),
+            Library::SDK(s) => Library::SDK(s.with_root_path(root_path)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemLibrary {
     pub system: String,
@@ -362,6 +372,22 @@ pub struct SDKLibrary {
     pub path: String,
     pub condition: Option<Vec<String>>,
     pub unless: Option<Vec<String>>,
+}
+
+impl WithRootPath for SDKLibrary {
+    fn with_root_path(&self, root_path: &Option<String>) -> Self {
+        if let Some(root) = root_path {
+            Self {
+                path: Path::new(root)
+                    .join(&self.path)
+                    .to_string_lossy()
+                    .to_string(),
+                ..self.clone()
+            }
+        } else {
+            self.clone()
+        }
+    }
 }
 
 #[derive(Debug)]
