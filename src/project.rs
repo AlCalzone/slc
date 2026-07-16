@@ -1,26 +1,29 @@
 use crate::{
-    Component, ComponentId, ConfigFile, ConfigFileOverride, Define, Feature, IncludeEntry,
-    IntermediateTemplateContribution, Library, Parent, Require, ResolvedConfigFile, ResolvedDefine,
-    ResolvedIncludeEntry, ResolvedLibrary, ResolvedSourceFile, ResolvedTemplateFile,
-    ResolvedWithParent, SDKId, Satisfied, SourceFile, TemplateContribution, TemplateFile,
-    WithRootPath, SDK,
+    substitute_instance, transform_instance_content, Component, ComponentId, ConfigFile,
+    ConfigFileOverride, Configuration, Conflict, Define, Feature, IncludeEntry,
+    IntermediateTemplateContribution, Library, OtherFile, Parent, PostBuild, Quality, Require,
+    ResolvedConfigFile, ResolvedDefine, ResolvedIncludeEntry, ResolvedLibrary, ResolvedSourceFile,
+    ResolvedTemplateFile, ResolvedWithParent, SDKId, Satisfied, SourceFile, TemplateContribution,
+    TemplateFile, ToolchainSetting, WithRootPath, SDK,
 };
-use core::panic;
+use minijinja::value::{Enumerator, Kwargs, Object, ObjectRepr};
+use minijinja::{AutoEscape, Environment, ErrorKind, State, Value};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
-    process::Stdio,
     rc::Rc,
-    vec,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectRaw {
+    #[serde(alias = "name")]
     pub project_name: String,
+    pub quality: Option<Quality>,
     pub sdk: SDKId,
     pub source: Option<Vec<SourceFile>>,
     pub include: Option<Vec<IncludeEntry>>,
@@ -29,13 +32,19 @@ pub struct ProjectRaw {
     pub define: Option<Vec<Define>>,
     pub requires: Option<Vec<Require>>,
     pub provides: Option<Vec<Feature>>,
+    pub conflicts: Option<Vec<Conflict>>,
     pub library: Option<Vec<Library>>,
     pub template_contribution: Option<Vec<TemplateContribution>>,
+    pub configuration: Option<Vec<Configuration>>,
+    pub toolchain_settings: Option<Vec<ToolchainSetting>>,
+    pub other_file: Option<Vec<OtherFile>>,
+    pub post_build: Option<PostBuild>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Project {
     pub project_name: String,
+    pub quality: Option<Quality>,
     pub sdk: SDKId,
     pub root_path: PathBuf,
     pub source: Option<Vec<SourceFile>>,
@@ -45,8 +54,13 @@ pub struct Project {
     pub define: Option<Vec<Define>>,
     pub requires: Option<Vec<Require>>,
     pub provides: Option<Vec<Feature>>,
+    pub conflicts: Option<Vec<Conflict>>,
     pub library: Option<Vec<Library>>,
     pub template_contribution: Option<Vec<TemplateContribution>>,
+    pub configuration: Option<Vec<Configuration>>,
+    pub toolchain_settings: Option<Vec<ToolchainSetting>>,
+    pub other_file: Option<Vec<OtherFile>>,
+    pub post_build: Option<PostBuild>,
 }
 
 impl Project {
@@ -55,12 +69,19 @@ impl Project {
         let mut file = File::open(path)?;
         let mut data = String::new();
         file.read_to_string(&mut data)?;
+        let root_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self::from_str(&data, root_path)
+    }
 
-        let raw: ProjectRaw = serde_yaml::from_str(&data)?;
-        let root_path = path.parent().unwrap().to_path_buf();
+    pub fn from_str(data: &str, root_path: PathBuf) -> Result<Project, Box<dyn Error>> {
+        let raw: ProjectRaw = serde_yaml::from_str(data)?;
 
         let ret = Self {
             project_name: raw.project_name,
+            quality: raw.quality,
             sdk: raw.sdk,
             root_path,
             source: raw.source,
@@ -70,42 +91,59 @@ impl Project {
             define: raw.define,
             requires: raw.requires,
             provides: raw.provides,
+            conflicts: raw.conflicts,
             library: raw.library,
             template_contribution: raw.template_contribution,
+            configuration: raw.configuration,
+            toolchain_settings: raw.toolchain_settings,
+            other_file: raw.other_file,
+            post_build: raw.post_build,
         };
 
         Ok(ret)
     }
 
-    pub fn resolve_components(&self, sdk: &SDK) -> ResolveResult {
-        // https://siliconlabs.github.io/slc-specification/1.0/features/#dependency-resolution
+    pub fn resolve_components(&self, sdk: &SDK) -> Result<ResolveResult, ResolveError> {
+        // https://siliconlabs.github.io/slc-specification/1.2/features/
 
         let mut components: Vec<Rc<Component>> = Vec::new();
+        let mut instances: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
         if let Some(ref comp_ids) = self.component {
             for id in comp_ids {
+                if let Some(list) = &id.instance {
+                    instances
+                        .entry(id.id.clone())
+                        .or_default()
+                        .extend(list.iter().cloned());
+                }
+                // Deduplicate: a component may appear in multiple instance entries
+                if components.iter().any(|c| c.id == id.id) {
+                    continue;
+                }
                 let c = sdk
                     .components()
                     .iter()
                     .find(|c| c.id == id.id)
-                    .unwrap_or_else(|| panic!("unknown component {}", id.id));
-
+                    .ok_or_else(|| ResolveError::UnknownComponent(id.id.clone()))?;
                 components.push(c.clone());
             }
         }
 
+        // The project itself contributes to the required (R) and provided (P)
+        // feature sets: its `requires` are requirements, its `provides` are
+        // features it satisfies on its own.
         let mut project_requires: BTreeSet<String> = BTreeSet::new();
         let mut project_provides: BTreeSet<String> = BTreeSet::new();
 
-        if let Some(ref provides) = self.provides {
-            for prov in provides {
-                project_requires.insert(prov.name.clone());
-            }
-        }
-
         if let Some(ref requires) = self.requires {
             for req in requires {
-                project_provides.insert(req.name.clone());
+                project_requires.insert(req.name.clone());
+            }
+        }
+        if let Some(ref provides) = self.provides {
+            for prov in provides {
+                project_provides.insert(prov.name.clone());
             }
         }
 
@@ -117,11 +155,11 @@ impl Project {
             let mut conflicts: BTreeSet<String> = BTreeSet::new();
 
             let mut added_component = false;
-            let mut had_multiple_candidates = false;
 
-            // Compute the sets of required, provided, and conflicting features.
+            // Fixpoint: a component provides a conditional feature only once the
+            // features its condition names are themselves provided. Keep adding
+            // until nothing new appears.
             loop {
-                // Keep adding until there's nothing new to add
                 let additional_provides: Vec<_> = components
                     .iter()
                     .filter_map(|c: &Rc<Component>| c.provides.as_ref())
@@ -161,149 +199,266 @@ impl Project {
                             .map(|f| f.name.to_string())
                     }),
             );
-
-            let unsatisfied = BTreeSet::from_iter(required_features.difference(&provided_features));
-            if unsatisfied.is_empty() {
-                if !conflicts.is_disjoint(&provided_features) {
-                    panic!("Dependency resolution failed: conflicting features");
-                }
-                // We're done
-                return ResolveResult {
-                    components,
-                    provided_features,
-                };
+            if let Some(ref pc) = self.conflicts {
+                conflicts.extend(
+                    pc.iter()
+                        .filter(|c| c.satisfied(&provided_features))
+                        .map(|c| c.name.clone()),
+                );
             }
 
-            let required_and_provided =
-                BTreeSet::from_iter(required_features.union(&provided_features).cloned());
+            let unsatisfied: BTreeSet<String> = required_features
+                .difference(&provided_features)
+                .cloned()
+                .collect();
+            if unsatisfied.is_empty() {
+                // Success criterion: K disjoint from P
+                let clashing: Vec<String> = conflicts
+                    .intersection(&provided_features)
+                    .cloned()
+                    .collect();
+                if !clashing.is_empty() {
+                    return Err(ResolveError::ConflictingFeatures(clashing));
+                }
+                // Success criterion: no feature is provided by more than one
+                // component unless every provider marks it `allow_multiple`.
+                check_duplicate_provides(&components, &provided_features)?;
+
+                return Ok(ResolveResult {
+                    components,
+                    provided_features,
+                    instances,
+                });
+            }
+
+            let required_and_provided: BTreeSet<String> = required_features
+                .union(&provided_features)
+                .cloned()
+                .collect();
+
+            // For each open requirement, find SDK components that could satisfy
+            // it (condition evaluated against R+P) without introducing a known
+            // conflict, excluding components already in C.
+            let mut zero_candidate: Option<String> = None;
+            let mut multi_candidate: Option<(String, Vec<String>)> = None;
 
             for req in unsatisfied.iter() {
-                // Find components...
                 let candidates: Vec<_> = sdk
                     .components()
                     .iter()
-                    // ... that provide the unsatisfied requirement
+                    .filter(|c| !components.iter().any(|e| e.id == c.id))
                     .filter(|c| {
                         let Some(provides) = &c.provides else {
                             return false;
                         };
                         provides
                             .iter()
-                            .any(|f| &&f.name == req && f.satisfied(&required_and_provided))
+                            .any(|f| &f.name == req && f.satisfied(&required_and_provided))
                     })
-                    // ... while not causing one of the known conflicts
+                    // Spec: a candidate must not provide any feature currently
+                    // in the conflict set K. (A candidate that itself conflicts
+                    // with an absent feature is fine; a real clash is caught by
+                    // the success criterion once the feature is present.)
                     .filter(|c| {
-                        let Some(conflicts) = &c.conflicts else {
+                        let Some(provides) = &c.provides else {
                             return true;
                         };
-                        conflicts
-                            .iter()
-                            .all(|c| !c.satisfied(&required_and_provided))
+                        !provides.iter().any(|f| {
+                            f.satisfied(&required_and_provided) && conflicts.contains(&f.name)
+                        })
                     })
                     .collect();
 
-                if candidates.len() == 1 {
-                    let c = *candidates.first().unwrap();
-                    components.push(c.clone());
-                    added_component = true;
-                } else if candidates.len() > 1 {
-                    had_multiple_candidates = true;
-                }
-            }
-
-            // FIXME: Ensure that No two components provide the same feature (unless the allow_multiple flag is set on all instances of the provide)
-
-            if !added_component {
-                if had_multiple_candidates {
-                    // Components may use the recommends key to recommend specific components by id. A recommended component is only considered
-                    // for inclusion in the project if it provides a feature in the set of unsatisfied requirements U, and if its provided features
-                    // are disjoint from those of all other recommended components.
-
-                    // Given the list of recommended components considered for inclusion, only one recommendation is added to C at a time, re-starting
-                    // the dependency resolution process after each addition. If multiple candidate components are considered for inclusion (each
-                    // satisfying a different requirement), the first candiate component as sorted alphabetically by id is always selected.
-                    let mut recommendation_ids: Vec<_> = components
-                        .iter()
-                        .filter_map(|c| c.recommends.as_ref())
-                        .flatten()
-                        .filter_map(|r| {
-                            if r.satisfied(&provided_features) {
-                                Some(r.id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    recommendation_ids.sort();
-
-                    let recommended_components: Vec<_> = recommendation_ids
-                        .into_iter()
-                        .map(|id| {
-                            sdk.components()
-                                .iter()
-                                .find(|c| c.id == id)
-                                .unwrap_or_else(|| panic!("unknown component {}", id))
-                        })
-                        // Filter only components that satisfy at least one requirement
-                        .filter(|c| {
-                            let Some(ref provides) = c.provides else {
-                                return false;
-                            };
-                            provides.iter().any(|f| {
-                                f.satisfied(&provided_features)
-                                    && !conflicts.contains(&f.name)
-                                    && unsatisfied.contains(&f.name)
-                            })
-                        })
-                        // and extract their feature set
-                        .map(|c| {
-                            let feature_set =
-                                BTreeSet::from_iter(c.provides.iter().flat_map(|p| {
-                                    p.iter()
-                                        .filter(|f| f.satisfied(&provided_features))
-                                        .map(|f| f.name.clone())
-                                }));
-                            (c, feature_set)
-                        })
-                        .collect();
-
-                    // eprintln!("recommendations:");
-                    // for r in &recommended_components {
-                    //     eprintln!("  {}", r.0.id);
-                    // }
-
-                    // Find recommendations that don't conflict with any of the other recommendations
-                    let non_conflicting_recommendations = recommended_components
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, (_, f))| {
-                            recommended_components
-                                .iter()
-                                .enumerate()
-                                .all(|(j, (_, g))| *i == j || f.is_disjoint(g))
-                        })
-                        .map(|(_, (c, _))| c)
-                        .collect::<Vec<_>>();
-
-                    // We found at least one. Take the first and continue
-                    if !non_conflicting_recommendations.is_empty() {
-                        let c = **non_conflicting_recommendations.first().unwrap();
-                        components.push(c.clone());
-                        continue;
+                match candidates.len() {
+                    0 => {
+                        if zero_candidate.is_none() {
+                            zero_candidate = Some(req.clone());
+                        }
+                    }
+                    1 => {
+                        components.push(candidates[0].clone());
+                        added_component = true;
+                    }
+                    _ => {
+                        if multi_candidate.is_none() {
+                            multi_candidate = Some((
+                                req.clone(),
+                                candidates.iter().map(|c| c.id.clone()).collect(),
+                            ));
+                        }
                     }
                 }
-
-                panic!(
-                    "Dependency resolution failed: no component found to satisfy open requirements"
-                );
             }
+
+            if added_component {
+                continue;
+            }
+
+            // Nothing auto-added. Try recommendations: a recommended component
+            // is considered only if it provides an open requirement, and its
+            // provided features are disjoint from every other recommendation.
+            // One is added per pass (alphabetically by id), then resolution
+            // restarts.
+            if multi_candidate.is_some() {
+                let mut recommendation_ids: Vec<_> = components
+                    .iter()
+                    .filter_map(|c| c.recommends.as_ref())
+                    .flatten()
+                    .filter(|r| r.satisfied(&provided_features))
+                    .map(|r| r.id.clone())
+                    .collect();
+                recommendation_ids.sort();
+                recommendation_ids.dedup();
+
+                let recommended_components: Vec<_> = recommendation_ids
+                    .into_iter()
+                    .filter(|id| !components.iter().any(|c| &c.id == id))
+                    .filter_map(|id| sdk.components().iter().find(|c| c.id == id))
+                    .filter(|c| {
+                        let Some(ref provides) = c.provides else {
+                            return false;
+                        };
+                        provides.iter().any(|f| {
+                            f.satisfied(&provided_features)
+                                && !conflicts.contains(&f.name)
+                                && unsatisfied.contains(&f.name)
+                        })
+                    })
+                    .map(|c| {
+                        let feature_set: BTreeSet<String> = c
+                            .provides
+                            .iter()
+                            .flat_map(|p| {
+                                p.iter()
+                                    .filter(|f| f.satisfied(&provided_features))
+                                    .map(|f| f.name.clone())
+                            })
+                            .collect();
+                        (c, feature_set)
+                    })
+                    .collect();
+
+                let non_conflicting_recommendations = recommended_components
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, (_, f))| {
+                        recommended_components
+                            .iter()
+                            .enumerate()
+                            .all(|(j, (_, g))| *i == j || f.is_disjoint(g))
+                    })
+                    .map(|(_, (c, _))| c)
+                    .collect::<Vec<_>>();
+
+                if let Some(c) = non_conflicting_recommendations.first() {
+                    components.push((**c).clone());
+                    continue;
+                }
+            }
+
+            // No progress possible: report the most specific failure.
+            if let Some(req) = zero_candidate {
+                return Err(ResolveError::UnsatisfiedRequirement(req));
+            }
+            if let Some((requirement, candidates)) = multi_candidate {
+                return Err(ResolveError::AmbiguousRequirement {
+                    requirement,
+                    candidates,
+                });
+            }
+            // Reachable only if every unsatisfied requirement is neither zero-
+            // nor multi-candidate, which cannot happen; guard defensively.
+            return Err(ResolveError::UnsatisfiedRequirement(
+                unsatisfied.into_iter().next().unwrap_or_default(),
+            ));
         }
     }
 }
 
+/// Enforce the SLC success criterion that no feature is provided by two
+/// components unless `allow_multiple` is set on every provider of it.
+fn check_duplicate_provides(
+    components: &[Rc<Component>],
+    provided_features: &BTreeSet<String>,
+) -> Result<(), ResolveError> {
+    let mut providers: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+    for c in components {
+        if let Some(provides) = &c.provides {
+            for f in provides {
+                if f.satisfied(provided_features) {
+                    providers
+                        .entry(f.name.clone())
+                        .or_default()
+                        .push((c.id.clone(), f.allow_multiple.unwrap_or(false)));
+                }
+            }
+        }
+    }
+    for (feature, provs) in &providers {
+        let distinct: BTreeSet<&String> = provs.iter().map(|(id, _)| id).collect();
+        if distinct.len() > 1 && !provs.iter().all(|(_, allow)| *allow) {
+            return Err(ResolveError::DuplicateProvide {
+                feature: feature.clone(),
+                components: distinct.into_iter().cloned().collect(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    UnknownComponent(String),
+    UnsatisfiedRequirement(String),
+    AmbiguousRequirement {
+        requirement: String,
+        candidates: Vec<String>,
+    },
+    ConflictingFeatures(Vec<String>),
+    DuplicateProvide {
+        feature: String,
+        components: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::UnknownComponent(id) => write!(f, "unknown component: {id}"),
+            ResolveError::UnsatisfiedRequirement(req) => {
+                write!(f, "no component provides required feature: {req}")
+            }
+            ResolveError::AmbiguousRequirement {
+                requirement,
+                candidates,
+            } => write!(
+                f,
+                "requirement {requirement} has multiple providers, none auto-selectable: {}",
+                candidates.join(", ")
+            ),
+            ResolveError::ConflictingFeatures(fs) => {
+                write!(f, "conflicting features provided: {}", fs.join(", "))
+            }
+            ResolveError::DuplicateProvide {
+                feature,
+                components,
+            } => write!(
+                f,
+                "feature {feature} provided by multiple components without allow_multiple: {}",
+                components.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+#[derive(Debug)]
 pub struct ResolveResult {
     pub components: Vec<Rc<Component>>,
     pub provided_features: BTreeSet<String>,
+    // Per-component instance names for instantiable components
+    pub instances: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -315,6 +470,8 @@ pub struct ParsedProject {
     pub template_file: Vec<ResolvedTemplateFile>,
     pub template_contribution: BTreeMap<String, Vec<minijinja::Value>>,
     pub config_file: Vec<ResolvedConfigFile>,
+    // Project-level configuration overrides, already filtered by condition/unless
+    pub configuration: Vec<Configuration>,
     pub root_path: PathBuf,
     pub sdk_root_path: PathBuf,
     pub provided_features: BTreeSet<String>,
@@ -409,20 +566,12 @@ impl ParsedProject {
         }
 
         if let Some(contrib) = &project.template_contribution {
-            for t in contrib.iter().filter_map(|e| {
-                if e.satisfied(all_features) {
-                    Some(Into::<IntermediateTemplateContribution>::into(e))
-                } else {
-                    None
-                }
-            }) {
+            for e in contrib.iter().filter(|e| e.satisfied(all_features)) {
+                let t = IntermediateTemplateContribution::from_contribution(e, "");
                 template_contribution
                     .entry(t.name.clone())
-                    .and_modify(|v| {
-                        v.push(t.clone());
-                        v.sort_by_key(|e| e.priority.unwrap_or(0));
-                    })
-                    .or_insert_with(|| vec![t]);
+                    .or_default()
+                    .push(t);
             }
         }
 
@@ -483,13 +632,23 @@ impl ParsedProject {
             }
 
             if let Some(d) = &comp.define {
-                define.extend(d.iter().filter_map(|e: &Define| {
-                    if e.satisfied(all_features) {
-                        Some(e.into())
+                let empty = Vec::new();
+                let comp_instances = resolved.instances.get(&comp.id).unwrap_or(&empty);
+                let is_instantiable = comp.instantiable.is_some() && !comp_instances.is_empty();
+                for e in d.iter().filter(|e| e.satisfied(all_features)) {
+                    let has_ph =
+                        has_instance_ph(&e.name) || e.value.as_deref().is_some_and(has_instance_ph);
+                    if is_instantiable && has_ph {
+                        for instance in comp_instances {
+                            define.push(ResolvedDefine {
+                                name: substitute_instance(&e.name, instance),
+                                value: e.value.as_deref().map(|v| substitute_instance(v, instance)),
+                            });
+                        }
                     } else {
-                        None
+                        define.push(e.into());
                     }
-                }));
+                }
             }
 
             if let Some(l) = &comp.library {
@@ -513,20 +672,12 @@ impl ParsedProject {
             }
 
             if let Some(contrib) = &comp.template_contribution {
-                for t in contrib.iter().filter_map(|e: &TemplateContribution| {
-                    if e.satisfied(all_features) {
-                        Some(Into::<IntermediateTemplateContribution>::into(e))
-                    } else {
-                        None
-                    }
-                }) {
+                for e in contrib.iter().filter(|e| e.satisfied(all_features)) {
+                    let t = IntermediateTemplateContribution::from_contribution(e, comp.id.clone());
                     template_contribution
                         .entry(t.name.clone())
-                        .and_modify(|v| {
-                            v.push(t.clone());
-                            v.sort_by_key(|e| e.priority.unwrap_or(0));
-                        })
-                        .or_insert_with(|| vec![t]);
+                        .or_default()
+                        .push(t);
                 }
             }
         }
@@ -543,45 +694,103 @@ impl ParsedProject {
         }
 
         for comp in &resolved.components {
+            let empty = Vec::new();
+            let comp_instances = resolved.instances.get(&comp.id).unwrap_or(&empty);
+            let prefix = comp.instantiable.as_ref().map(|i| i.prefix.as_str());
+
             if let Some(c) = &comp.config_file {
-                // Only include non-override config files. For each, check if there exists an override we should use instead
+                // Only include non-override config files; for each, look for an
+                // override to substitute in.
                 for e in c
                     .iter()
                     .filter(|e| e.r#override.is_none() && e.satisfied(all_features))
                 {
-                    // Overriding a configuration file that doesn't have a file_id in the original component is not supported.
-                    if e.file_id.is_none() {
-                        config_file.push(e.with_root_path(&comp.root_path).resolved(Parent::SDK));
-                        continue;
-                    }
-
-                    // Try to find an override for this config
-                    let override_key = ConfigFileOverride {
-                        file_id: e.file_id.as_ref().unwrap().clone(),
-                        component: comp.id.clone(),
-                    };
-                    let overr = config_file_overrides.get(&override_key);
-
-                    if let Some(overr) = overr {
-                        // If there is an override, use it instead of the original, but preserve some of the fields
-                        config_file.push(ResolvedConfigFile {
-                            export: e.export,
-                            ..overr.clone()
-                        });
+                    // Expand one entry per instance when the component is
+                    // instantiable and the path carries an {{instance}} token;
+                    // otherwise a single non-instance rendering.
+                    let expand: Vec<Option<&str>> = if prefix.is_some()
+                        && !comp_instances.is_empty()
+                        && has_instance_ph(&e.path)
+                    {
+                        comp_instances.iter().map(|i| Some(i.as_str())).collect()
                     } else {
-                        // If not, use the original
-                        config_file.push(e.with_root_path(&comp.root_path).resolved(Parent::SDK));
+                        vec![None]
+                    };
+
+                    for inst in expand {
+                        // Source path uses the prefix; output name uses the instance name
+                        let (src_path, output_name) = match (inst, prefix) {
+                            (Some(instance), Some(pfx)) => {
+                                let src = substitute_instance(&e.path, pfx);
+                                let out = Path::new(&substitute_instance(&e.path, instance))
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned());
+                                (src, out)
+                            }
+                            _ => (e.path.clone(), None),
+                        };
+
+                        // Prefer an instance-specific override over a generic one
+                        let overr = e.file_id.as_ref().and_then(|fid| {
+                            let by_instance = inst.and_then(|instance| {
+                                config_file_overrides.get(&ConfigFileOverride {
+                                    file_id: fid.clone(),
+                                    component: comp.id.clone(),
+                                    instance: Some(instance.to_string()),
+                                })
+                            });
+                            by_instance.or_else(|| {
+                                config_file_overrides.get(&ConfigFileOverride {
+                                    file_id: fid.clone(),
+                                    component: comp.id.clone(),
+                                    instance: None,
+                                })
+                            })
+                        });
+
+                        let resolved_cf = if let Some(overr) = overr {
+                            ResolvedConfigFile {
+                                export: e.export,
+                                output_name: output_name.clone(),
+                                instance: inst.map(str::to_string),
+                                ..overr.clone()
+                            }
+                        } else {
+                            ResolvedConfigFile {
+                                path: join_root(&comp.root_path, &src_path),
+                                parent: Parent::SDK,
+                                file_id: e.file_id.clone(),
+                                directory: e.directory.clone(),
+                                export: e.export,
+                                output_name,
+                                instance: inst.map(str::to_string),
+                            }
+                        };
+                        config_file.push(resolved_cf);
                     }
                 }
             }
         }
 
+        // Stable sort preserves declaration order within a (priority, component_id) tie
         let template_contribution: BTreeMap<String, Vec<minijinja::Value>> = template_contribution
             .into_iter()
-            .map(|(k, v)| {
+            .map(|(k, mut v)| {
+                v.sort_by(|a, b| {
+                    (a.priority.unwrap_or(0), &a.component_id)
+                        .cmp(&(b.priority.unwrap_or(0), &b.component_id))
+                });
                 let values: Vec<_> = v.into_iter().map(|t| t.value).collect();
                 (k, values)
             })
+            .collect();
+
+        let configuration: Vec<Configuration> = project
+            .configuration
+            .iter()
+            .flatten()
+            .filter(|c| c.satisfied(all_features))
+            .cloned()
             .collect();
 
         Self {
@@ -590,6 +799,7 @@ impl ParsedProject {
             source,
             include,
             config_file,
+            configuration,
             define,
             library,
             template_file,
@@ -598,67 +808,99 @@ impl ParsedProject {
         }
     }
 
+    fn root_for(&self, parent: Parent) -> &PathBuf {
+        match parent {
+            Parent::Project => &self.root_path,
+            Parent::SDK => &self.sdk_root_path,
+        }
+    }
+
+    /// Generate the full project output tree under `out_dir`, including `autogen/` and `config/` directories
+    pub fn generate(&self, out_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+        let out_dir = out_dir.as_ref();
+        for sub in ["autogen/export", "config/export"] {
+            fs::create_dir_all(out_dir.join(sub))?;
+        }
+        let mut written = self.generate_config_files(out_dir)?;
+        written.extend(self.generate_templates(out_dir)?);
+        Ok(written)
+    }
+
     pub fn generate_templates(
         &self,
         out_dir: impl AsRef<Path>,
     ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-        let vars = serde_yaml::to_string(&self.template_contribution)?;
-        let script = include_str!("render_template.py");
+        let autogen = out_dir.as_ref().join("autogen");
+        let export = autogen.join("export");
+        fs::create_dir_all(&export)?;
 
-        let out_dir = out_dir.as_ref().join("autogen");
-        fs::create_dir_all(&out_dir)?;
+        let mut env = Environment::new();
+        // Preserve trailing newlines (off by default in minijinja)
+        env.set_keep_trailing_newline(true);
+        env.set_auto_escape_callback(|name| match name.rsplit('.').next() {
+            Some("html" | "htm" | "xml" | "xhtml") => AutoEscape::Html,
+            _ => AutoEscape::None,
+        });
+        // Overrides minijinja's printf-style `format` with the SLC line-prefix variant
+        env.add_filter("format", format_filter);
+        // Backs the jinja2 `list.append()` idiom that minijinja can't do natively
+        env.add_function("new_list", || Value::from_object(MutableList::default()));
+
+        // Contribution variables are available to every template by name.
+        let mut base_ctx: BTreeMap<String, Value> = BTreeMap::new();
+        for (name, values) in &self.template_contribution {
+            base_ctx.insert(name.clone(), Value::from_serialize(values));
+        }
 
         let mut ret = Vec::new();
 
         for template in &self.template_file {
-            let root_path = match template.parent {
-                Parent::Project => &self.root_path,
-                Parent::SDK => &self.sdk_root_path,
-            };
-            let template_path = root_path.join(&template.path);
-            let out_filename = if let Some(n) = template.path.strip_suffix(".jinja") {
-                n
-            } else if let Some(n) = template.path.strip_suffix(".jinja2") {
-                n
+            let template_path = self.root_for(template.parent).join(&template.path);
+
+            // The source file name (with its .jinja suffix) names the template in the generated banner.
+            let source_name = Path::new(&template.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("template path has no file name")?
+                .to_string();
+
+            let stripped = template
+                .path
+                .strip_suffix(".jinja")
+                .or_else(|| template.path.strip_suffix(".jinja2"))
+                .unwrap_or(&template.path);
+            let out_name = Path::new(stripped)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("template path has no file name")?
+                .to_string();
+
+            let dir = if template.export == Some(true) {
+                &export
             } else {
-                panic!("template file must have .jinja or .jinja2 extension")
+                &autogen
             };
-            let out_filename = Path::new(out_filename).file_name().unwrap();
-            let out_path = out_dir.join(out_filename);
+            let out_path = dir.join(&out_name);
 
-            // read the file at template_path into a string
-            let mut file = File::open(&template_path)?;
-            let mut template_content = String::new();
-            file.read_to_string(&mut template_content)?;
+            let mut content = String::new();
+            File::open(&template_path)?.read_to_string(&mut content)?;
+            let content = rewrite_empty_list_sets(&content);
 
-            // Use python to render the template
-            let mut python = std::process::Command::new("python3")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .arg("-")
-                .env("VARS", vars.clone())
-                .env("TEMPLATE", template_content)
-                .spawn()
-                .expect("failed to spawn python3");
+            // The autogenerated_file/_c_file banners naming this source template.
+            let banner = autogenerated_banner(&source_name);
+            let mut ctx = base_ctx.clone();
+            ctx.insert(
+                "autogenerated_c_file".into(),
+                Value::from(prefix_each_line(&banner, "// ", "")),
+            );
+            ctx.insert("autogenerated_file".into(), Value::from(banner));
 
-            // Write embedded script to python stdin
-            let mut stdin = python.stdin.take().expect("Failed to open stdin");
-            stdin
-                .write_all(script.as_bytes())
-                .expect("failed to write to stdin");
-            drop(stdin);
-
-            // And capture the output, so we can write it to a file
-            let output = python.wait_with_output().expect("failed to read output");
-            if !output.status.success() {
-                panic!(
-                    "template generator returned error:{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            let output = output.stdout;
-
-            fs::write(&out_path, output)?;
+            // Name the template by its output name so autoescape keys off the
+            // real extension rather than `.jinja`.
+            let rendered = env
+                .render_named_str(&out_name, &content, Value::from(ctx))
+                .map_err(|e| format!("rendering {source_name}: {e:#}"))?;
+            fs::write(&out_path, rendered)?;
             ret.push(out_path);
         }
 
@@ -669,72 +911,89 @@ impl ParsedProject {
         &self,
         out_dir: impl AsRef<Path>,
     ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-        if self.config_file.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let out_dir = out_dir.as_ref().join("config");
-        fs::create_dir_all(&out_dir)?;
+        let config_root = out_dir.as_ref().join("config");
+        fs::create_dir_all(config_root.join("export"))?;
 
         let mut ret = Vec::new();
 
         for config_file in &self.config_file {
-            let root_path = match config_file.parent {
-                Parent::Project => &self.root_path,
-                Parent::SDK => &self.sdk_root_path,
-            };
-            let config_path = root_path.join(&config_file.path);
-            let config_filename = config_path.file_name().unwrap();
-
-            let out_path_suffix = match (&config_file.directory, &config_file.export) {
-                (None, Some(true)) => Some("export".to_string()),
-                (Some(_), Some(true)) => {
-                    panic!("config file cannot have both directory and export")
-                }
-                (Some(ref d), _) => Some(d.clone()),
-                (None, _) => None,
+            let src = self.root_for(config_file.parent).join(&config_file.path);
+            // Prefer the given name of an instantiable config file, fall back to the source file name.
+            let config_filename: String = match &config_file.output_name {
+                Some(n) => n.clone(),
+                None => src
+                    .file_name()
+                    .ok_or("config file path has no file name")?
+                    .to_string_lossy()
+                    .into_owned(),
             };
 
-            let out_path = if let Some(suffix) = out_path_suffix {
-                out_dir.join(suffix).join(config_filename)
+            // Determine the output path based on export, directory, and output_name properties
+            let out_path = if config_file.export == Some(true) {
+                config_root.join("export").join(&config_filename)
+            } else if let Some(dir) = &config_file.directory {
+                config_root.join(dir).join(&config_filename)
             } else {
-                out_dir.join(config_filename)
+                config_root.join(&config_filename)
             };
 
-            fs::copy(&config_path, &out_path)?;
+            // Spec: a config file already present in config/ is not overwritten,
+            // preserving user edits across regeneration.
+            if out_path.exists() {
+                ret.push(out_path);
+                continue;
+            }
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
 
+            let mut contents = fs::read_to_string(&src)?;
+            if let Some(instance) = &config_file.instance {
+                contents = transform_instance_content(&src, instance, &contents);
+            }
+            let contents = self.apply_configuration(&contents);
+            fs::write(&out_path, contents)?;
             ret.push(out_path);
         }
 
         Ok(ret)
     }
 
+    /// Rewrite `#define NAME value` lines in a freshly-copied config header
+    /// with the project's configuration overrides
+    fn apply_configuration(&self, contents: &str) -> String {
+        if self.configuration.is_empty() {
+            return contents.to_string();
+        }
+        // Later entries overwrite earlier ones -> last match wins.
+        let mut values: HashMap<&str, &str> = HashMap::new();
+        for c in &self.configuration {
+            values.insert(c.name.as_str(), c.value.as_str());
+        }
+
+        let mut out = String::with_capacity(contents.len());
+        for line in contents.split_inclusive('\n') {
+            out.push_str(&rewrite_define_line(line, &values));
+        }
+        out
+    }
+
     pub fn get_included_headers(&self) -> Vec<PathBuf> {
         let mut ret = Vec::new();
 
         for source in &self.source {
-            let root_path = match source.parent {
-                Parent::Project => &self.root_path,
-                Parent::SDK => &self.sdk_root_path,
-            };
-
-            let source_path = root_path.join(&source.path);
-            if source_path.extension().map_or(false, |e| e == "h") {
+            let source_path = self.root_for(source.parent).join(&source.path);
+            if is_header(&source_path) {
                 ret.push(source_path);
             }
         }
 
         for include in &self.include {
             if let Some(file_list) = &include.file_list {
-                let root_path = match include.parent {
-                    Parent::Project => &self.root_path,
-                    Parent::SDK => &self.sdk_root_path,
-                };
-                let include_path = root_path.join(&include.path);
-
+                let include_path = self.root_for(include.parent).join(&include.path);
                 for file in file_list {
                     let header_path = include_path.join(&file.path);
-                    if header_path.extension().map_or(false, |e| e == "h") {
+                    if is_header(&header_path) {
                         ret.push(header_path);
                     }
                 }
@@ -742,5 +1001,169 @@ impl ParsedProject {
         }
 
         ret
+    }
+}
+
+fn is_header(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("h" | "hh" | "hpp" | "hxx")
+    )
+}
+
+/// Join a component-relative path onto its optional root_path
+fn join_root(root: &Option<String>, path: &str) -> String {
+    match root {
+        Some(r) => Path::new(r).join(path).to_string_lossy().into_owned(),
+        None => path.to_string(),
+    }
+}
+
+/// Whether a path contains an `{{instance}}` placeholder.
+fn has_instance_ph(s: &str) -> bool {
+    substitute_instance(s, "\u{1}") != s
+}
+
+/// Replace `#define NAME ...` in `line` with the given overrides, if any
+fn rewrite_define_line(line: &str, values: &HashMap<&str, &str>) -> String {
+    let (content, nl) = match line.strip_suffix('\n') {
+        Some(c) => (c, "\n"),
+        None => (line, ""),
+    };
+    let trimmed = content.trim_start();
+    let indent = &content[..content.len() - trimmed.len()];
+
+    let Some(after) = trimmed.strip_prefix("#define") else {
+        return line.to_string();
+    };
+    // `#define` must be followed by whitespace, else it is not a directive.
+    if !after.starts_with(|c: char| c.is_whitespace()) {
+        return line.to_string();
+    }
+    let after = after.trim_start();
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return line.to_string();
+    }
+    // Skip function-like macros: a '(' immediately after the name.
+    if after[name.len()..].starts_with('(') {
+        return line.to_string();
+    }
+    match values.get(name.as_str()) {
+        Some(value) => format!("{indent}#define {name} {value}{nl}"),
+        None => line.to_string(),
+    }
+}
+
+/// The banner the built-in `autogenerated_file` global expands to
+fn autogenerated_banner(template_name: &str) -> String {
+    format!(
+        "This file is autogenerated by Silicon Labs SLC.\n\
+         The contents of this file will be replaced in their entirety upon regeneration.\n\
+         Source template file: {template_name}"
+    )
+}
+
+/// Prefix and suffix every line of `text`.
+fn prefix_each_line(text: &str, prefix: &str, suffix: &str) -> String {
+    text.split('\n')
+        .map(|line| format!("{prefix}{line}{suffix}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The SLC `format` filter: adds `prefix`/`suffix` to each line of the piped
+/// value, e.g. `autogenerated_file | format(prefix='// ')`.
+fn format_filter(value: String, kwargs: Kwargs) -> Result<String, minijinja::Error> {
+    let prefix: String = kwargs.get::<Option<String>>("prefix")?.unwrap_or_default();
+    let suffix: String = kwargs.get::<Option<String>>("suffix")?.unwrap_or_default();
+    kwargs.assert_all_used()?;
+    Ok(prefix_each_line(&value, &prefix, &suffix))
+}
+
+// Backs the jinja2 `list.append()` idiom that minijinja can't do natively
+#[derive(Debug, Default)]
+struct MutableList(Mutex<Vec<Value>>);
+
+impl Object for MutableList {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Seq
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        let idx = key.as_usize()?;
+        self.0.lock().unwrap().get(idx).cloned()
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Seq(self.0.lock().unwrap().len())
+    }
+
+    fn call_method(
+        self: &Arc<Self>,
+        _state: &State<'_, '_>,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        match method {
+            // Returns none so `{% if x.append(y) %}` stays falsy, matching jinja2.
+            "append" => {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(args.first().cloned().unwrap_or(Value::UNDEFINED));
+                Ok(Value::from(()))
+            }
+            other => Err(minijinja::Error::new(
+                ErrorKind::UnknownMethod,
+                format!("MutableList has no method {other}"),
+            )),
+        }
+    }
+}
+
+/// Rewrite `{% set <ident> = [] %}` to `{% set <ident> = new_list() %}` so the
+/// list can later be mutated via `.append(...)`
+fn rewrite_empty_list_sets(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("{%") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let Some(end) = after.find("%}") else {
+            out.push_str(after);
+            return out;
+        };
+        let block = &after[..end + 2];
+        out.push_str(&rewrite_set_block(block));
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn rewrite_set_block(block: &str) -> String {
+    let inner = &block[2..block.len() - 2];
+    let lead = if inner.starts_with('-') { "-" } else { "" };
+    let trail = if inner.ends_with('-') { "-" } else { "" };
+    let body = inner.trim_matches('-').trim();
+
+    let Some(assign) = body.strip_prefix("set ") else {
+        return block.to_string();
+    };
+    let Some((name, value)) = assign.split_once('=') else {
+        return block.to_string();
+    };
+    let name = name.trim();
+    if value.trim() == "[]"
+        && !name.is_empty()
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        format!("{{%{lead} set {name} = new_list() {trail}%}}")
+    } else {
+        block.to_string()
     }
 }

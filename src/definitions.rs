@@ -89,11 +89,16 @@ impl WithRootPath for ConfigFile {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedConfigFile {
+    // Source path on disk, already instance-prefix-substituted
     pub path: String,
     pub parent: Parent,
     pub file_id: Option<String>,
     pub directory: Option<String>,
     pub export: Option<bool>,
+    // Output file name override for instantiable components
+    pub output_name: Option<String>,
+    // Instance this file was expanded for
+    pub instance: Option<String>,
 }
 
 impl ResolvedWithParent for ConfigFile {
@@ -106,6 +111,8 @@ impl ResolvedWithParent for ConfigFile {
             file_id: self.file_id.clone(),
             directory: self.directory.clone(),
             export: self.export,
+            output_name: None,
+            instance: None,
         }
     }
 }
@@ -114,6 +121,8 @@ impl ResolvedWithParent for ConfigFile {
 pub struct ConfigFileOverride {
     pub file_id: String,
     pub component: String,
+    // Targets a single instance of an instantiable component
+    pub instance: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,14 +240,17 @@ pub struct IntermediateTemplateContribution {
     pub name: String,
     pub value: minijinja::Value,
     pub priority: Option<i16>,
+    // Contributing component id, used as tiebreak when priorities match
+    pub component_id: String,
 }
 
-impl From<&TemplateContribution> for IntermediateTemplateContribution {
-    fn from(t: &TemplateContribution) -> Self {
+impl IntermediateTemplateContribution {
+    pub fn from_contribution(t: &TemplateContribution, component_id: impl Into<String>) -> Self {
         Self {
             name: t.name.clone(),
             value: t.value.clone(),
             priority: t.priority,
+            component_id: component_id.into(),
         }
     }
 }
@@ -345,5 +357,127 @@ impl From<&SDKLibrary> for ResolvedSDKLibrary {
         Self {
             path: s.path.clone(),
         }
+    }
+}
+
+/// Component/project quality level
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quality {
+    Production,
+    Evaluation,
+    Experimental,
+    Deprecated,
+    Internal,
+}
+
+impl Quality {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "production" => Quality::Production,
+            "evaluation" => Quality::Evaluation,
+            "experimental" => Quality::Experimental,
+            "deprecated" => Quality::Deprecated,
+            "internal" => Quality::Internal,
+            // Legacy alias retained for backwards compatibility
+            "test" => Quality::Experimental,
+            _ => Quality::Evaluation,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Quality {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Quality::from_str_lossy(&s))
+    }
+}
+
+/// A component that can be included multiple times under distinct instance names
+#[derive(Debug, Clone, Deserialize)]
+pub struct Instantiable {
+    pub prefix: String,
+}
+
+/// A project-level override of a component configuration option
+#[derive(Debug, Clone, Deserialize)]
+pub struct Configuration {
+    pub name: String,
+    pub value: String,
+    pub condition: Option<Vec<String>>,
+    pub unless: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolchainSetting {
+    pub option: String,
+    pub value: String,
+    pub condition: Option<Vec<String>>,
+    pub unless: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OtherFile {
+    pub path: String,
+    pub directory: Option<String>,
+    pub condition: Option<Vec<String>>,
+    pub unless: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostBuildEntry {
+    // Exactly one of profile/path is expected
+    pub profile: Option<String>,
+    pub path: Option<String>,
+    pub condition: Option<Vec<String>>,
+    pub unless: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PostBuild {
+    One(PostBuildEntry),
+    Many(Vec<PostBuildEntry>),
+}
+
+impl PostBuild {
+    pub fn entries(&self) -> &[PostBuildEntry] {
+        match self {
+            PostBuild::One(e) => std::slice::from_ref(e),
+            PostBuild::Many(v) => v,
+        }
+    }
+}
+
+/// Replace `{{instance}}` with the given value
+pub fn substitute_instance(input: &str, value: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("{{") {
+        if let Some(end_rel) = rest[start..].find("}}") {
+            let inner = &rest[start + 2..start + end_rel];
+            if inner.trim() == "instance" {
+                out.push_str(&rest[..start]);
+                out.push_str(value);
+                rest = &rest[start + end_rel + 2..];
+                continue;
+            }
+        }
+        // Not an {{instance}} token: keep the "{{" and continue scanning past it
+        out.push_str(&rest[..start + 2]);
+        rest = &rest[start + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Transform config-file content for an instance, matching the conventions of the target filenames
+pub fn transform_instance_content(path: &Path, instance: &str, content: &str) -> String {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("h" | "hh" | "hpp" | "hxx") => content.replace("INSTANCE", &instance.to_uppercase()),
+        Some("xml") => substitute_instance(content, instance),
+        _ => content.to_string(),
     }
 }
