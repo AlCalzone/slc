@@ -2,6 +2,13 @@
 name = "slcgen"
 version = "0.1.0"
 edition = "2021"
+description = "A fast Rust reimplementation of a subset of the Silicon Labs slc-cli project generator"
+repository = "https://github.com/AlCalzone/slc"
+license = "MIT"
+
+# Ship only what consumers build; Cargo.toml, Cargo.lock, and README are
+# always included regardless of this allowlist.
+include = ["src/**/*.rs", "LICENSE"]
 
 # The crate publishes as `slcgen`, but the binary and library keep the `slc`
 # name so the command stays `slc` and internal `slc::` imports are unchanged.
