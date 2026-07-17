@@ -6,6 +6,14 @@ targeting the [SLC specification 1.2](https://siliconlabs.github.io/slc-specific
 HIGHLY EXPERIMENTAL. No guarantees are made about compatibility with Silicon
 Labs' official code generator.
 
+## Installation
+
+```
+cargo install slcgen
+```
+
+The crate is published as `slcgen`; it installs a binary named `slc`.
+
 ## Usage
 
 ```
